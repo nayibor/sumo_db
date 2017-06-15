@@ -28,6 +28,7 @@
   start_link/3,
   create_schema/2,
   persist/2,
+  fetch/3,
   delete_by/3,
   delete_all/2,
   find_all/2,
@@ -35,6 +36,7 @@
   find_by/3,
   find_by/5,
   find_by/6,
+  count/2,
   call/4
 ]).
 
@@ -71,9 +73,18 @@
 
 -callback init(term()) -> {ok, term()}.
 
+-callback create_schema(Schema, State) -> Res when
+  Schema :: sumo:schema(),
+  Res    :: result(State).
+
 -callback persist(Doc, State) -> Res when
   Doc :: sumo_internal:doc(),
   Res :: result(sumo_internal:doc(), State).
+
+-callback fetch(Schema, Id, State) -> Res when
+  Schema :: sumo:schema_name(),
+  Id     :: sumo:field_value(),
+  Res    :: result(sumo_internal:doc(), State).
 
 -callback delete_by(Schema, Conditions, State) -> Res when
   Schema     :: sumo:schema_name(),
@@ -115,7 +126,9 @@
   Offset :: non_neg_integer(),
   Res    :: result([sumo_internal:doc()], State).
 
--callback create_schema(sumo:schema(), State) -> result(State).
+-callback count(Schema, State) -> Res when
+  Schema :: sumo:schema_name(),
+  Res    :: result(non_neg_integer(), State).
 
 %%%=============================================================================
 %%% API
@@ -147,6 +160,15 @@ create_schema(Name, Schema) ->
 persist(Name, Doc) ->
   wpool:call(Name, {persist, Doc}).
 
+%% @doc Fetch a single doc by its `Id'.
+-spec fetch(Name, DocName, Id) -> Res when
+  Name    :: atom(),
+  DocName :: sumo:schema_name(),
+  Id      :: sumo:field_value(),
+  Res     :: {ok, sumo_internal:doc()} | {error, term()}.
+fetch(Name, DocName, Id) ->
+  wpool:call(Name, {fetch, DocName, Id}).
+
 %% @doc Deletes the docs identified by the given conditions.
 -spec delete_by(Name, DocName, Conditions) -> Res when
   Name       :: atom(),
@@ -158,17 +180,17 @@ delete_by(Name, DocName, Conditions) ->
 
 %% @doc Deletes all docs in the given store name.
 -spec delete_all(Name, DocName) -> Res when
-  Name       :: atom(),
-  DocName    :: sumo:schema_name(),
-  Res        :: {ok, non_neg_integer()} | {error, term()}.
+  Name    :: atom(),
+  DocName :: sumo:schema_name(),
+  Res     :: {ok, non_neg_integer()} | {error, term()}.
 delete_all(Name, DocName) ->
   wpool:call(Name, {delete_all, DocName}).
 
 %% @doc Returns all docs from the given store name.
 -spec find_all(Name, DocName) -> Res when
-  Name       :: atom(),
-  DocName    :: sumo:schema_name(),
-  Res        :: {ok, [sumo_internal:doc()]} | {error, term()}.
+  Name    :: atom(),
+  DocName :: sumo:schema_name(),
+  Res     :: {ok, [sumo_internal:doc()]} | {error, term()}.
 find_all(Name, DocName) ->
   wpool:call(Name, {find_all, DocName}).
 
@@ -227,6 +249,13 @@ find_by(Name, DocName, Conditions, Limit, Offset) ->
 find_by(Name, DocName, Conditions, SortFields, Limit, Offset) ->
   wpool:call(Name, {find_by, DocName, Conditions, SortFields, Limit, Offset}).
 
+%% @doc Counts the total number of docs in the given schema name `DocName'.
+-spec count(Name, DocName) -> Res when
+  Name    :: atom(),
+  DocName :: sumo:schema_name(),
+  Res     :: {ok, non_neg_integer()} | {error, term()}.
+count(Name, DocName) ->
+  wpool:call(Name, {count, DocName}).
 
 %% @doc Calls a custom function in the given store name.
 -spec call(Name, DocName, Function, Args) -> Res when
@@ -258,10 +287,27 @@ init([Module, Options]) ->
 %% @hidden
 -spec handle_call(term(), _, state()) -> {reply, tuple(), state()}.
 handle_call(
+  {create_schema, Schema}, _From,
+  #state{handler = Handler, handler_state = HState} = State
+) ->
+  {Result, NewState} = case Handler:create_schema(Schema, HState) of
+    {ok, NewState_} -> {ok, NewState_};
+    {error, Error, NewState_} -> {{error, Error}, NewState_}
+  end,
+  {reply, Result, State#state{handler_state=NewState}};
+
+handle_call(
   {persist, Doc}, _From,
   #state{handler = Handler, handler_state = HState} = State
 ) ->
   {OkOrError, Reply, NewState} = Handler:persist(Doc, HState),
+  {reply, {OkOrError, Reply}, State#state{handler_state=NewState}};
+
+handle_call(
+  {fetch, DocName, Id}, _From,
+  #state{handler = Handler, handler_state = HState} = State
+) ->
+  {OkOrError, Reply, NewState} = Handler:fetch(DocName, Id, HState),
   {reply, {OkOrError, Reply}, State#state{handler_state=NewState}};
 
 handle_call(
@@ -320,22 +366,19 @@ handle_call(
   {reply, {OkOrError, Reply}, State#state{handler_state=NewState}};
 
 handle_call(
+  {count, DocName}, _From,
+  #state{handler = Handler, handler_state = HState} = State
+) ->
+  {OkOrError, Reply, NewState} = Handler:count(DocName, HState),
+  {reply, {OkOrError, Reply}, State#state{handler_state = NewState}};
+
+handle_call(
   {call, DocName, Function, Args}, _From,
   #state{handler = Handler, handler_state = HState} = State
 ) ->
   RealArgs = lists:append(Args, [DocName, HState]),
   {OkOrError, Reply, NewState} = erlang:apply(Handler, Function, RealArgs),
-  {reply, {OkOrError, Reply}, State#state{handler_state=NewState}};
-
-handle_call(
-  {create_schema, Schema}, _From,
-  #state{handler = Handler, handler_state = HState} = State
-) ->
-  {Result, NewState} = case Handler:create_schema(Schema, HState) of
-    {ok, NewState_} -> {ok, NewState_};
-    {error, Error, NewState_} -> {{error, Error}, NewState_}
-  end,
-  {reply, Result, State#state{handler_state=NewState}}.
+  {reply, {OkOrError, Reply}, State#state{handler_state=NewState}}.
 
 %% @hidden
 -spec handle_cast(term(), state()) ->

@@ -22,42 +22,39 @@
 -license("Apache License 2.0").
 
 %%% API
--export([dispatch/2, dispatch/3]).
+-export([dispatch/2, dispatch/3, dispatch/4]).
+
+%%% Types
+-type event_id() :: reference().
+
+-export_type([event_id/0]).
 
 %%%=============================================================================
 %%% API
 %%%=============================================================================
 
 %% @doc Dispatch an event through gen_event:notify/2.
--spec dispatch(sumo:schema_name(), term()) -> ok.
+-spec dispatch(sumo:schema_name(), term()) -> event_id() | no_event_managers.
 dispatch(DocName, Event) ->
   dispatch(DocName, Event, []).
 
 %% @doc Dispatch an event through gen_event:notify/2.
--spec dispatch(sumo:schema_name(), term(), term()) -> ok.
+-spec dispatch(sumo:schema_name(), term(), term()) ->
+  event_id() | no_event_managers.
 dispatch(DocName, Event, Args) ->
-  case get_event_manager(DocName) of
-    undefined    -> ok;
-    EventManager -> gen_event:notify(EventManager, {DocName, Event, Args})
-  end.
+  EventId = make_ref(),
+  dispatch(DocName, EventId, Event, Args).
 
-%%%=============================================================================
-%%% Internal functions
-%%%=============================================================================
-
-%% @doc Returns the name of the event manager configured for the given
-%% doc, or undefined.
--spec get_event_manager(DocName) -> Res when
-  DocName :: sumo:schema_name(),
-  Res     :: undefined | atom()| {atom(), term()}.
-get_event_manager(DocName) ->
-  Docs = application:get_env(sumo_db, events, []),
-  case Docs of
-    undefined ->
-      undefined;
+%% @doc Dispatch an event through gen_event:notify/2.
+-spec dispatch(sumo:schema_name(), event_id(), term(), term()) ->
+  event_id() | no_event_managers.
+dispatch(DocName, EventId, Event, Args) ->
+  case sumo_config:get_event_managers(DocName) of
+    [] ->
+      no_event_managers;
     EventManagers ->
-      case sumo_utils:keyfind(DocName, EventManagers) of
-        undefined -> undefined;
-        Name      -> Name
-      end
+      ok = lists:foreach(fun(EventManager) ->
+        gen_event:notify(EventManager, {EventId, DocName, Event, Args})
+      end, EventManagers),
+      EventId
   end.

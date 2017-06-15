@@ -21,17 +21,19 @@
 -author("Brujo Benavides <elbrujohalcon@inaka.net>").
 -license("Apache License 2.0").
 
--behavior(sumo_store).
+-behaviour(sumo_store).
 
 %% API
 -export([
   init/1,
   create_schema/2,
   persist/2,
+  fetch/3,
   delete_by/3,
   delete_all/2,
   find_all/2, find_all/5,
-  find_by/3, find_by/5, find_by/6
+  find_by/3, find_by/5, find_by/6,
+  count/2
 ]).
 
 %%%=============================================================================
@@ -41,7 +43,10 @@
 -type option() :: disc_copies | ram_copies | majority
                 | snmp | storage_properties.
 
--type state() :: #{default_options => [{option(), term()}]}.
+-type state() :: #{
+  verbose         => boolean(),
+  default_options => [{option(), term()}]
+}.
 
 %%%=============================================================================
 %%% API
@@ -50,14 +55,14 @@
 -spec init(term()) -> {ok, state()}.
 init(Options) ->
   DefaultOptions = parse(Options),
-  {ok, #{default_options => DefaultOptions}}.
+  Verbose = application:get_env(sumo_db, verbose, false),
+  {ok, #{default_options => DefaultOptions, verbose => Verbose}}.
 
 -spec persist(Doc, State) -> Response when
   Doc      :: sumo_internal:doc(),
   State    :: state(),
   Response :: sumo_store:result(sumo_internal:doc(), state()).
 persist(Doc, State) ->
-  %% Set the real id, replacing undefined by 0 so it is auto-generated
   DocName = sumo_internal:doc_name(Doc),
   IdField = sumo_internal:id_field_name(DocName),
   Id = sumo_internal:get_field(IdField, Doc),
@@ -78,11 +83,31 @@ persist(Doc, State) ->
       {error, Reason, State};
     {atomic, ok} ->
       NewDoc = sumo_internal:set_field(IdField, NewId, Doc),
+      _ = maybe_log(persist, [DocName, NewDoc], State),
       {ok, NewDoc, State}
   end.
 
--spec delete_by(sumo:schema_name(), sumo:conditions(), state()) ->
-  sumo_store:result(sumo_store:affected_rows(), state()).
+-spec fetch(DocName, Id, State) -> Response when
+  DocName  :: sumo:schema_name(),
+  Id       :: sumo:field_value(),
+  State    :: state(),
+  Response :: sumo_store:result(sumo_internal:doc(), state()).
+fetch(DocName, Id, State) ->
+  try
+    [Result] = mnesia:dirty_read(DocName, Id),
+    Schema = sumo_internal:get_schema(DocName),
+    Fields = schema_field_names(Schema),
+    _ = maybe_log(fetch, [DocName, Id], State),
+    {ok, wakeup(result_to_doc(Result, Fields)), State}
+  catch
+    _:_ -> {error, notfound, State}
+  end.
+
+-spec delete_by(DocName, Conditions, State) -> Response when
+  DocName    :: sumo:schema_name(),
+  Conditions :: sumo:conditions(),
+  State      :: state(),
+  Response   :: sumo_store:result(sumo_store:affected_rows(), state()).
 delete_by(DocName, Conditions, State) ->
   MatchSpec = build_match_spec(DocName, Conditions),
   Transaction = fun() ->
@@ -94,61 +119,72 @@ delete_by(DocName, Conditions, State) ->
     {aborted, Reason} ->
       {error, Reason, State};
     {atomic, Result} ->
+      _ = maybe_log(delete_by, [DocName, Conditions], State),
       {ok, Result, State}
   end.
 
--spec delete_all(sumo:schema_name(), state()) ->
-  sumo_store:result(sumo_store:affected_rows(), state()).
+-spec delete_all(DocName, State) -> Response when
+  DocName  :: sumo:schema_name(),
+  State    :: state(),
+  Response :: sumo_store:result(sumo_store:affected_rows(), state()).
 delete_all(DocName, State) ->
   Count = mnesia:table_info(DocName, size),
   case mnesia:clear_table(DocName) of
     {atomic, ok} ->
+      _ = maybe_log(delete_all, [DocName], State),
       {ok, Count, State};
     {aborted, Reason} ->
       {error, Reason, State}
   end.
 
--spec find_all(sumo:schema_name(), state()) ->
-  sumo_store:result([sumo_internal:doc()], state()).
+-spec find_all(DocName, State) -> Response when
+  DocName  :: sumo:schema_name(),
+  State    :: state(),
+  Response :: sumo_store:result([sumo_internal:doc()], state()).
 find_all(DocName, State) ->
   find_all(DocName, [], 0, 0, State).
 
--spec find_all(
-  sumo:schema_name(),
-  term(),
-  non_neg_integer(),
-  non_neg_integer(),
-  state()
-) -> sumo_store:result([sumo_internal:doc()], state()).
+-spec find_all(DocName, SortFields, Limit, Offset, State) -> Response when
+  DocName    :: sumo:schema_name(),
+  SortFields :: term(),
+  Limit      :: non_neg_integer(),
+  Offset     :: non_neg_integer(),
+  State      :: state(),
+  Response   :: sumo_store:result([sumo_internal:doc()], state()).
 find_all(DocName, SortFields, Limit, Offset, State) ->
   find_by(DocName, [], SortFields, Limit, Offset, State).
 
--spec find_by(sumo:schema_name(), sumo:conditions(), state()) ->
-  sumo_store:result([sumo_internal:doc()], state()).
+-spec find_by(DocName, Conditions, State) -> Response when
+  DocName    :: sumo:schema_name(),
+  Conditions :: sumo:conditions(),
+  State      :: state(),
+  Response   :: sumo_store:result([sumo_internal:doc()], state()).
 find_by(DocName, Conditions, State) ->
   find_by(DocName, Conditions, [], 0, 0, State).
 
--spec find_by(
-  sumo:schema_name(),
-  sumo:conditions(),
-  non_neg_integer(),
-  non_neg_integer(),
-  state()
-) -> sumo_store:result([sumo_internal:doc()], state()).
+-spec find_by(DocName, Conditions, Limit, Offset, State) -> Response when
+  DocName    :: sumo:schema_name(),
+  Conditions :: sumo:conditions(),
+  Limit      :: non_neg_integer(),
+  Offset     :: non_neg_integer(),
+  State      :: state(),
+  Response   :: sumo_store:result([sumo_internal:doc()], state()).
 find_by(DocName, Conditions, Limit, Offset, State) ->
   find_by(DocName, Conditions, [], Limit, Offset, State).
 
--spec find_by(
-  sumo:schema_name(),
-  sumo:conditions(),
-  term(),
-  non_neg_integer(),
-  non_neg_integer(),
-  state()
-) -> sumo_store:result([sumo_internal:doc()], state()).
+-spec find_by(DocName, Conditions, Sort, Limit, Offset, State) -> Response when
+  DocName    :: sumo:schema_name(),
+  Conditions :: sumo:conditions(),
+  Sort       :: term(),
+  Limit      :: non_neg_integer(),
+  Offset     :: non_neg_integer(),
+  State      :: state(),
+  Response   :: sumo_store:result([sumo_internal:doc()], state()).
 find_by(DocName, Conditions, [], Limit, Offset, State) ->
   MatchSpec = build_match_spec(DocName, Conditions),
-  Transaction0 = fun() -> mnesia:select(DocName, MatchSpec) end,
+  Transaction0 = fun() ->
+    mnesia:select(DocName, MatchSpec)
+  end,
   TransactionL = fun() ->
     case mnesia:select(DocName, MatchSpec, Offset + Limit, read) of
       {ManyItems, _Cont} ->
@@ -168,12 +204,16 @@ find_by(DocName, Conditions, [], Limit, Offset, State) ->
       Schema = sumo_internal:get_schema(DocName),
       Fields = schema_field_names(Schema),
       Docs = [wakeup(result_to_doc(Result, Fields)) || Result <- Results],
+      _ = maybe_log(find_by, [DocName, Conditions, Limit, Offset, MatchSpec], State),
       {ok, Docs, State}
   end;
-find_by(_DocName, _Conditions, _SortFields, _Limit, _Offset, State) ->
+find_by(_DocName, _Conditions, _Sort, _Limit, _Offset, State) ->
   {error, not_supported, State}.
 
--spec create_schema(sumo:schema(), state()) -> sumo_store:result(state()).
+-spec create_schema(Schema, State) -> Response when
+  Schema   :: sumo:schema(),
+  State    :: state(),
+  Response :: sumo_store:result(state()).
 create_schema(Schema, #{default_options := DefaultOptions} = State) ->
   Name = sumo_internal:schema_name(Schema),
   Fields = schema_fields(Schema),
@@ -191,6 +231,18 @@ create_schema(Schema, #{default_options := DefaultOptions} = State) ->
     {atomic, ok}                      -> {ok, State};
     {aborted, {already_exists, Name}} -> {ok, State};
     {aborted, Reason}                 -> {error, Reason, State}
+  end.
+
+-spec count(DocName, State) -> Response when
+  DocName  :: sumo:schema_name(),
+  State    :: state(),
+  Response :: sumo_store:result(non_neg_integer(), state()).
+count(DocName, State) ->
+  try
+    Size = mnesia:table_info(DocName, size),
+    {ok, Size, State}
+  catch
+    _:Reason -> {error, Reason, State}
   end.
 
 %%%=============================================================================
@@ -237,7 +289,7 @@ new_id(string)    -> uuid:uuid_to_string(uuid:get_v4(), standard);
 new_id(binary)    -> uuid:uuid_to_string(uuid:get_v4(), binary_standard);
 new_id(integer)   -> <<Id:128>> = uuid:get_v4(), Id;
 new_id(float)     -> <<Id:128>> = uuid:get_v4(), Id * 1.0;
-new_id(FieldType) -> throw({unimplemented, FieldType}).
+new_id(FieldType) -> exit({unimplemented, FieldType}).
 
 %% @doc http://www.erlang.org/doc/apps/erts/match_spec.html
 %% @private
@@ -303,7 +355,7 @@ condition_to_guard({Name, Value}, FieldsMap) ->
   condition_to_guard({Name, '==', Value}, FieldsMap).
 
 %% @private
-check_operator(like) -> throw({unsupported_operator, like});
+check_operator(like) -> exit({unsupported_operator, like});
 check_operator(Op)   -> sumo_internal:check_operator(Op).
 
 %% @private
@@ -336,9 +388,7 @@ result_to_doc(Result, Fields) ->
 
 %% @private
 transform_conditions(DocName, Conditions) ->
-  sumo_utils:transform_conditions(
-    fun validate_date/1, DocName, Conditions, [date]
-  ).
+  sumo_utils:transform_conditions(fun validate_date/1, DocName, Conditions, [date]).
 
 %% @private
 validate_date({FieldType, _, FieldValue}) ->
@@ -373,3 +423,16 @@ wakeup_fun(date, _, {Date, _} = _FieldValue, _) ->
   Date;
 wakeup_fun(_, _, FieldValue, _) ->
   FieldValue.
+
+%% @private
+maybe_log(Fun, Args, #{verbose := true}) ->
+  error_logger:info_msg(log_format(Fun), Args);
+maybe_log(_, _, _) ->
+  ok.
+
+%% @private
+log_format(persist)    -> "persist(~p, ~p)";
+log_format(fetch)      -> "fetch(~p, ~p)";
+log_format(delete_by)  -> "delete_by(~p, ~p)";
+log_format(delete_all) -> "delete_all(~p)";
+log_format(find_by)    -> "find_by(~p, ~p, [], ~p, ~p)~nMatchSpec: ~p".

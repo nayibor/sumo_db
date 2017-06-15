@@ -1,6 +1,6 @@
 -module(sumo_basic_test_helper).
 
-%% Test Cases - Helpers
+%% Common Test Cases
 -export([
   create_schema/1,
   find/1,
@@ -9,8 +9,12 @@
   delete_all/1,
   delete/1,
   check_proper_dates/1,
-  init_store/1
+  count/1,
+  persist_using_changeset/1
 ]).
+
+%% Shared Helpers
+-export([init_store/1]).
 
 -type config() :: [{atom(), term()}].
 
@@ -32,9 +36,10 @@ find(Config) ->
   Module = sumo_config:get_prop_value(Name, module),
 
   [First, Second | _] = sumo:find_all(Name),
-  First = sumo:find(Name, Module:id(First)),
-  Second = sumo:find(Name, Module:id(Second)),
-  notfound = sumo:find(Name, 0),
+  First = sumo:find_one(Name, [{id, Module:id(First)}]),
+  Second = sumo:fetch(Name, Module:id(Second)),
+  notfound = sumo:fetch(Name, 0),
+  notfound = sumo:find_one(Name, [{id, 0}]),
   ok.
 
 -spec find_all(config()) -> ok.
@@ -114,6 +119,8 @@ delete_all(Config) ->
   {_, Name} = lists:keyfind(name, 1, Config),
 
   sumo:delete_all(Name),
+  {EventId, Name, pre_delete_all, []} = pick_up_event(),
+  {EventId, Name, deleted_all, []} = pick_up_event(),
   [] = sumo:find_all(Name),
   ok.
 
@@ -123,14 +130,27 @@ delete(Config) ->
   Module = sumo_config:get_prop_value(Name, module),
 
   %% delete_by
-  2 = sumo:delete_by(Name, [{last_name, <<"D">>}]),
-  Results = sumo:find_by(Name, [{last_name, <<"D">>}]),
+  Conditions = [{last_name, <<"D">>}],
+  2 = sumo:delete_by(Name, Conditions),
+
+  {EventId, Name, pre_deleted_total, [Conditions]} = pick_up_event(),
+  {EventId, Name, deleted_total, [2, Conditions]} = pick_up_event(),
+
+  Results = sumo:find_by(Name, Conditions),
   [] = Results,
 
   %% delete
   [First | _ ] = All = sumo:find_all(Name),
   Id = Module:id(First),
   sumo:delete(Name, Id),
+
+  % sumo:delete/2 uses internally sumo:delete_by/2, we handle those events too
+  IdField = sumo_internal:id_field_name(Name),
+  {EventId2, Name, pre_deleted, [Id]} = pick_up_event(),
+  {EventId4, Name, pre_deleted_total, [[{IdField, Id}]]} = pick_up_event(),
+  {EventId4, Name, deleted_total, [1, [{IdField, Id}]]} = pick_up_event(),
+  {EventId2, Name, deleted, [Id]} = pick_up_event(),
+
   NewAll = sumo:find_all(Name),
   [_] = All -- NewAll,
   ok.
@@ -141,7 +161,7 @@ check_proper_dates(Config) ->
   Module = sumo_config:get_prop_value(Name, module),
 
   [P0] = sumo:find_by(Name, [{name, <<"A">>}]),
-  P1 = sumo:find(Name, Module:id(P0)),
+  P1 = sumo:fetch(Name, Module:id(P0)),
   [P2 | _] = sumo:find_all(Name),
 
   {Date, _} = calendar:universal_time(),
@@ -153,9 +173,50 @@ check_proper_dates(Config) ->
   Date = Module:birthdate(P2),
   {Date, {_, _, _}} = Module:created_at(P2),
 
-  Person = sumo:persist(Name, Module:new(<<"X">>, <<"Z">>, 6)),
+  Person = create(Name, Module:new(<<"X">>, <<"Z">>, 6)),
   Date = Module:birthdate(Person),
   ok.
+
+-spec count(config()) -> ok.
+count(Config) ->
+  {_, Name} = lists:keyfind(name, 1, Config),
+
+  8 = length(sumo:find_all(Name)),
+  8 = sumo:count(Name),
+
+  _ = try sumo:count(wrong)
+  catch
+    _:no_workers -> ok
+  end,
+
+  Conditions = [{last_name, <<"D">>}],
+  2 = sumo:delete_by(Name, Conditions),
+  6 = sumo:count(Name),
+  ok.
+
+-spec persist_using_changeset(config()) -> ok.
+persist_using_changeset(Config) ->
+  {_, Name} = lists:keyfind(name, 1, Config),
+  Module = sumo_config:get_prop_value(Name, module),
+
+  [] = sumo:find_by(Name, [{name, <<"John">>}]),
+  [P1] = sumo:find_by(Name, [{name, <<"A">>}]),
+
+  Schema = Module:sumo_schema(),
+  Allowed = [sumo_internal:field_name(F) || F <- sumo_internal:schema_fields(Schema)],
+  CS1 = sumo_changeset:cast(people, P1, #{name => <<"John">>, age => 34}, Allowed),
+  _ = sumo:persist(CS1),
+  [P2] = sumo:find_by(Name, [{name, <<"John">>}]),
+  <<"John">> = Module:name(P2),
+  34 = Module:age(P2),
+
+  CS2 = sumo_changeset:validate_number(CS1, age, [{less_than_or_equal_to, 33}]),
+  {error, CS2} = sumo:persist(CS2),
+  ok.
+
+%%%=============================================================================
+%%% Helpers
+%%%=============================================================================
 
 -spec init_store(atom()) -> ok.
 init_store(Name) ->
@@ -165,8 +226,8 @@ init_store(Name) ->
 
   DT = {Date, _} = calendar:universal_time(),
 
-  sumo:persist(Name, Module:new(<<"A">>, <<"E">>, 6)),
-  sumo:persist(Name, Module:from_map(#{
+  create(Name, Module:new(<<"A">>, <<"E">>, 6)),
+  create(Name, Module:from_map(#{
     name         => <<"B">>,
     last_name    => <<"D">>,
     age          => 3,
@@ -174,13 +235,13 @@ init_store(Name) ->
     created_at   => DT,
     weird_field1 => true
   })),
-  sumo:persist(Name, Module:new(<<"C">>, <<"C">>, 5)),
-  sumo:persist(Name, Module:new(<<"D">>, <<"D">>, 4)),
-  sumo:persist(Name, Module:new(<<"E">>, <<"A">>, 2)),
-  sumo:persist(Name, Module:new(<<"F">>, <<"E">>, 1)),
-  sumo:persist(Name, Module:new(<<"Model T-2000">>, <<"undefined">>, 7)),
+  create(Name, Module:new(<<"C">>, <<"C">>, 5)),
+  create(Name, Module:new(<<"D">>, <<"D">>, 4)),
+  create(Name, Module:new(<<"E">>, <<"A">>, 2)),
+  create(Name, Module:new(<<"F">>, <<"E">>, 1)),
+  create(Name, Module:new(<<"Model T-2000">>, <<"undefined">>, 7)),
 
-  sumo:persist(Name, Module:from_map(#{
+  create(Name, Module:from_map(#{
     name          => <<"Name">>,
     last_name     => <<"LastName">>,
     age           => 3,
@@ -194,4 +255,23 @@ init_store(Name) ->
     weird_field2  => [1, true, <<"hi">>, 1.1],
     weird_field3  => #{a => 1, b => [1, "2", <<"3">>], <<"c">> => false}
   })),
+
+  clean_events(),
   ok.
+
+%%%=============================================================================
+%%% Internal functions
+%%%=============================================================================
+
+pick_up_event() ->
+  sumo_test_people_events_manager:pick_up_event().
+
+clean_events() ->
+  sumo_test_people_events_manager:clean_events().
+
+create(Name, Args) ->
+  clean_events(),
+  Res = sumo:persist(Name, Args),
+  {EventId, Name, pre_persisted, [Args]} = pick_up_event(),
+  {EventId, Name, persisted, [Res]} = pick_up_event(),
+  Res.
